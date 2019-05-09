@@ -124,7 +124,7 @@ func (q *Query) updateMetric(conn *connection, res map[string]interface{}, value
 	}
 	// make space for all defined variable label columns and the "static" labels
 	// added below
-	labels := make([]string, 0, len(q.Labels)+5)
+	labels := make([]string, 0, len(q.Labels)+1)
 	for _, label := range q.Labels {
 		// we need to fill every spot in the slice or the key->value mapping
 		// won't match up in the end.
@@ -143,10 +143,10 @@ func (q *Query) updateMetric(conn *connection, res map[string]interface{}, value
 		}
 		labels = append(labels, lv)
 	}
-	labels = append(labels, conn.driver)
-	labels = append(labels, conn.host)
-	labels = append(labels, conn.database)
-	labels = append(labels, conn.user)
+	//labels = append(labels, conn.driver)
+	//labels = append(labels, conn.host)
+	//labels = append(labels, conn.database)
+	//labels = append(labels, conn.user)
 	labels = append(labels, valueName)
 	// create a new immutable const metric that can be cached and returned on
 	// every scrape. Remember that the order of the lable values in the labels

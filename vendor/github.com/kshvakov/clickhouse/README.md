@@ -1,4 +1,4 @@
-# ClickHouse [![Build Status](https://travis-ci.org/kshvakov/clickhouse.svg?branch=master)](https://travis-ci.org/kshvakov/clickhouse) [![Go Report Card](https://goreportcard.com/badge/github.com/kshvakov/clickhouse)](https://goreportcard.com/report/github.com/kshvakov/clickhouse) [![Coverage Status](https://coveralls.io/repos/github/kshvakov/clickhouse/badge.svg?branch=master)](https://coveralls.io/github/kshvakov/clickhouse?branch=master)
+# ClickHouse [![Build Status](https://travis-ci.org/kshvakov/clickhouse.svg?branch=master)](https://travis-ci.org/kshvakov/clickhouse) [![Go Report Card](https://goreportcard.com/badge/github.com/kshvakov/clickhouse)](https://goreportcard.com/report/github.com/kshvakov/clickhouse) [![codecov](https://codecov.io/gh/kshvakov/clickhouse/branch/master/graph/badge.svg)](https://codecov.io/gh/kshvakov/clickhouse)
 
 Golang SQL database driver for [Yandex ClickHouse](https://clickhouse.yandex/) 
 
@@ -7,6 +7,8 @@ Golang SQL database driver for [Yandex ClickHouse](https://clickhouse.yandex/)
 * Uses native ClickHouse tcp client-server protocol
 * Compatibility with `database/sql`
 * Round Robin load-balancing
+* Bulk write support :  `begin->prepare->(in loop exec)->commit`
+* LZ4 compression support (default to use pure go lz4, switch to use cgo lz4 by turn clz4 build tags on)
 
 ## DSN 
 
@@ -15,8 +17,18 @@ Golang SQL database driver for [Yandex ClickHouse](https://clickhouse.yandex/)
 * read_timeout/write_timeout - timeout in second 
 * no_delay   - disable/enable the Nagle Algorithm for tcp socket (default is 'true' - disable)
 * alt_hosts  - comma separated list of single address host for load-balancing
-* block_size - maximum rows in block (default is 100000). If the rows are larger then the data will be split into several blocks to send them to the server
+* connection_open_strategy - random/in_order (default random). 
+    * random   - choose random server from set 
+    * in_order - first live server is choosen in specified order
+* block_size - maximum rows in block (default is 1000000). If the rows are larger then the data will be split into several blocks to send them to the server
+* pool size - maximum amount of preallocated byte chunks used in queries (default is 100). Decrease this if you experience memory problems at the expense of more GC pressure and vice versa.
 * debug - enable debug output (boolean value)
+
+SSL/TLS parameters:
+
+* secure - establish secure connection (default is false)
+* skip_verify - skip certificate verification (default is false)
+* tls_config - name of a TLS config with client certificates, registered using `clickhouse.RegisterTLSConfig()`; implies secure to be true, unless explicitly specified
 
 example:
 ```
@@ -32,11 +44,13 @@ tcp://host1:9000?username=user&password=qwerty&database=clicks&read_timeout=10&w
 * Date 
 * DateTime
 * Enum
+* UUID
+* Nullable(T)
 * [Array(T) (one-dimensional)](https://clickhouse.yandex/reference_en.html#Array(T)) [godoc](https://godoc.org/github.com/kshvakov/clickhouse#Array)
 
 ## TODO
 
-* Compression 
+* Support other compression methods(zstd ...)
 
 ## Install
 ```
@@ -88,6 +102,7 @@ func main() {
 		tx, _   = connect.Begin()
 		stmt, _ = tx.Prepare("INSERT INTO example (country_code, os_id, browser_id, categories, action_day, action_time) VALUES (?, ?, ?, ?, ?, ?)")
 	)
+	defer stmt.Close()
 
 	for i := 0; i < 100; i++ {
 		if _, err := stmt.Exec(
@@ -110,6 +125,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer rows.Close()
 
 	for rows.Next() {
 		var (

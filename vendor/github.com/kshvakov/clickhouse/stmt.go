@@ -4,20 +4,26 @@ import (
 	"bytes"
 	"context"
 	"database/sql/driver"
+	"unicode"
+
+	"github.com/kshvakov/clickhouse/lib/data"
 )
 
 type stmt struct {
 	ch       *clickhouse
 	query    string
+	counter  int
 	numInput int
 	isInsert bool
-	counter  int
 }
 
 var emptyResult = &result{}
 
 func (stmt *stmt) NumInput() int {
-	if stmt.numInput < 0 {
+	switch {
+	case stmt.ch.block != nil:
+		return len(stmt.ch.block.Columns)
+	case stmt.numInput < 0:
 		return 0
 	}
 	return stmt.numInput
@@ -27,26 +33,35 @@ func (stmt *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	return stmt.execContext(context.Background(), args)
 }
 
-func (stmt *stmt) execContext(ctx context.Context, args []driver.Value) (driver.Result, error) {
-	if finish := stmt.ch.watchCancel(ctx); finish != nil {
-		defer finish()
+func (stmt *stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	dargs := make([]driver.Value, len(args))
+	for i, nv := range args {
+		dargs[i] = nv.Value
 	}
+	return stmt.execContext(ctx, dargs)
+}
+
+func (stmt *stmt) execContext(ctx context.Context, args []driver.Value) (driver.Result, error) {
 	if stmt.isInsert {
 		stmt.counter++
-		if err := stmt.ch.data.append(args); err != nil {
+		if err := stmt.ch.block.AppendRow(args); err != nil {
 			return nil, err
 		}
 		if (stmt.counter % stmt.ch.blockSize) == 0 {
-			if err := stmt.ch.data.write(stmt.ch.serverRevision, stmt.ch.conn); err != nil {
+			stmt.ch.logf("[exec] flush block")
+			if err := stmt.ch.writeBlock(stmt.ch.block); err != nil {
+				return nil, err
+			}
+			if err := stmt.ch.encoder.Flush(); err != nil {
 				return nil, err
 			}
 		}
 		return emptyResult, nil
 	}
-	if err := stmt.ch.sendQuery(stmt.query); err != nil {
+	if err := stmt.ch.sendQuery(stmt.bind(convertOldArgs(args))); err != nil {
 		return nil, err
 	}
-	if _, err := stmt.ch.receiveData(); err != nil {
+	if err := stmt.ch.process(); err != nil {
 		return nil, err
 	}
 	return emptyResult, nil
@@ -56,17 +71,44 @@ func (stmt *stmt) Query(args []driver.Value) (driver.Rows, error) {
 	return stmt.queryContext(context.Background(), convertOldArgs(args))
 }
 
-func (stmt *stmt) queryContext(ctx context.Context, args []namedValue) (driver.Rows, error) {
+func (stmt *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	return stmt.queryContext(ctx, args)
+}
+
+func (stmt *stmt) queryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	finish := stmt.ch.watchCancel(ctx)
+	if err := stmt.ch.sendQuery(stmt.bind(args)); err != nil {
+		finish()
+		return nil, err
+	}
+	meta, err := stmt.ch.readMeta()
+	if err != nil {
+		finish()
+		return nil, err
+	}
+	rows := rows{
+		ch:           stmt.ch,
+		finish:       finish,
+		stream:       make(chan *data.Block, 50),
+		columns:      meta.ColumnNames(),
+		blockColumns: meta.Columns,
+	}
+	go rows.receiveData()
+	return &rows, nil
+}
+
+func (stmt *stmt) Close() error {
+	stmt.ch.logf("[stmt] close")
+	return nil
+}
+
+func (stmt *stmt) bind(args []driver.NamedValue) string {
 	var (
 		buf     bytes.Buffer
 		index   int
 		keyword bool
+		limit   = newMatcher("limit")
 	)
-
-	if finish := stmt.ch.watchCancel(ctx); finish != nil {
-		defer finish()
-	}
-
 	switch {
 	case stmt.NumInput() != 0:
 		reader := bytes.NewReader([]byte(stmt.query))
@@ -96,10 +138,19 @@ func (stmt *stmt) queryContext(ctx context.Context, args []namedValue) (driver.R
 						char == '>',
 						char == '(',
 						char == ',',
-						char == '%':
+						char == '%',
+						char == '+',
+						char == '-',
+						char == '*',
+						char == '/',
+						char == '[':
 						keyword = true
 					default:
-						keyword = keyword && (char == ' ' || char == '\t' || char == '\n')
+						if limit.matchRune(char) {
+							keyword = true
+						} else {
+							keyword = keyword && unicode.IsSpace(char)
+						}
 					}
 					buf.WriteRune(char)
 				}
@@ -110,34 +161,13 @@ func (stmt *stmt) queryContext(ctx context.Context, args []namedValue) (driver.R
 	default:
 		buf.WriteString(stmt.query)
 	}
-
-	if err := stmt.ch.sendQuery(buf.String()); err != nil {
-		return nil, err
-	}
-
-	rows, err := stmt.ch.receiveData()
-	if err != nil {
-		return nil, err
-	}
-
-	return rows, nil
+	return buf.String()
 }
 
-func (stmt *stmt) Close() error {
-	stmt.ch.logf("[stmt] close")
-	return nil
-}
-
-type namedValue struct {
-	Name    string
-	Ordinal int
-	Value   driver.Value
-}
-
-func convertOldArgs(args []driver.Value) []namedValue {
-	dargs := make([]namedValue, len(args))
+func convertOldArgs(args []driver.Value) []driver.NamedValue {
+	dargs := make([]driver.NamedValue, len(args))
 	for i, v := range args {
-		dargs[i] = namedValue{
+		dargs[i] = driver.NamedValue{
 			Ordinal: i + 1,
 			Value:   v,
 		}

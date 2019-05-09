@@ -1,0 +1,9 @@
+prefix=/opt/app/oracle
+libdir=${prefix}/product/12.2.0/client/lib
+includedir=${prefix}/product/12.2.0/client/rdbms/public
+
+Name: oci8
+Description: Oracle Call Interface
+Libs: -L${libdir} -Wl,-rpath,${libdir} -lclntsh
+Cflags: -I${includedir}
+Version: 12.2

@@ -1,13 +1,28 @@
 package clickhouse
 
-func (ch *clickhouse) ping() error {
+import (
+	"context"
+	"database/sql/driver"
+
+	"github.com/kshvakov/clickhouse/lib/protocol"
+)
+
+func (ch *clickhouse) Ping(ctx context.Context) error {
+	return ch.ping(ctx)
+}
+
+func (ch *clickhouse) ping(ctx context.Context) error {
+	if ch.conn.closed {
+		return driver.ErrBadConn
+	}
 	ch.logf("-> ping")
-	if err := writeUvarint(ch.conn, ClientPingPacket); err != nil {
+	finish := ch.watchCancel(ctx)
+	defer finish()
+	if err := ch.encoder.Uvarint(protocol.ClientPing); err != nil {
 		return err
 	}
-	if err := ch.gotPacket(ServerPongPacket); err != nil {
+	if err := ch.encoder.Flush(); err != nil {
 		return err
 	}
-	ch.logf("<- pong")
-	return nil
+	return ch.process()
 }

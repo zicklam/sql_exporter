@@ -1,37 +1,29 @@
 package clickhouse
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"net"
+	"reflect"
 	"regexp"
+	"sync"
 	"time"
+
+	"github.com/kshvakov/clickhouse/lib/binary"
+	"github.com/kshvakov/clickhouse/lib/column"
+	"github.com/kshvakov/clickhouse/lib/data"
+	"github.com/kshvakov/clickhouse/lib/protocol"
+	"github.com/kshvakov/clickhouse/lib/types"
 )
 
-const (
-	ClientHelloPacket  = 0
-	ClientQueryPacket  = 1
-	ClientDataPacket   = 2
-	ClientCancelPacket = 3
-	ClientPingPacket   = 4
-)
-
-const (
-	StateComplete = 2
-)
-
-const (
-	ServerHelloPacket       = 0
-	ServerDataPacket        = 1
-	ServerExceptionPacket   = 2
-	ServerProgressPacket    = 3
-	ServerPongPacket        = 4
-	ServerEndOfStreamPacket = 5
-	ServerProfileInfoPacket = 6
-	ServerTotalsPacket      = 7
-	ServerExtremesPacket    = 8
+type (
+	Date     = types.Date
+	DateTime = types.DateTime
+	UUID     = types.UUID
 )
 
 var (
@@ -46,28 +38,36 @@ var (
 type logger func(format string, v ...interface{})
 
 type clickhouse struct {
-	logf               logger
-	conn               *connect
-	serverName         string
-	serverRevision     uint64
-	serverVersionMinor uint64
-	serverVersionMajor uint64
-	serverTimezone     *time.Location
-	data               *block
-	blockSize          int
-	inTransaction      bool
+	sync.Mutex
+	data.ServerInfo
+	data.ClientInfo
+	logf          logger
+	conn          *connect
+	block         *data.Block
+	buffer        *bufio.Writer
+	decoder       *binary.Decoder
+	encoder       *binary.Encoder
+	compress      bool
+	blockSize     int
+	inTransaction bool
 }
 
 func (ch *clickhouse) Prepare(query string) (driver.Stmt, error) {
 	return ch.prepareContext(context.Background(), query)
 }
 
+func (ch *clickhouse) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	return ch.prepareContext(ctx, query)
+}
+
 func (ch *clickhouse) prepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	ch.logf("[prepare] %s", query)
-	if ch.data != nil {
+	switch {
+	case ch.conn.closed:
+		return nil, driver.ErrBadConn
+	case ch.block != nil:
 		return nil, ErrLimitDataRequestInTx
-	}
-	if isInsert(query) {
+	case isInsert(query):
 		if !ch.inTransaction {
 			return nil, ErrInsertInNotBatchMode
 		}
@@ -80,37 +80,28 @@ func (ch *clickhouse) prepareContext(ctx context.Context, query string) (driver.
 	}, nil
 }
 
-func (ch *clickhouse) insert(query string) (driver.Stmt, error) {
+func (ch *clickhouse) insert(query string) (_ driver.Stmt, err error) {
 	if err := ch.sendQuery(splitInsertRe.Split(query, -1)[0] + " VALUES "); err != nil {
 		return nil, err
 	}
-	for {
-		packet, err := readUvarint(ch.conn)
-		if err != nil {
-			return nil, err
-		}
-		switch packet {
-		case ServerDataPacket:
-			var block block
-			if err := block.read(ch.serverRevision, ch.conn); err != nil {
-				return nil, err
-			}
-			ch.data = &block
-			return &stmt{
-				ch:       ch,
-				isInsert: true,
-				numInput: numInput(query),
-			}, nil
-		case ServerExceptionPacket:
-			return nil, ch.exception()
-		default:
-			return nil, fmt.Errorf("unexpected packet [%d] from server", packet)
-		}
+	if ch.block, err = ch.readMeta(); err != nil {
+		return nil, err
 	}
+	return &stmt{
+		ch:       ch,
+		isInsert: true,
+	}, nil
 }
 
 func (ch *clickhouse) Begin() (driver.Tx, error) {
 	return ch.beginTx(context.Background(), txOptions{})
+}
+
+func (ch *clickhouse) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	return ch.beginTx(ctx, txOptions{
+		Isolation: int(opts.Isolation),
+		ReadOnly:  opts.ReadOnly,
+	})
 }
 
 type txOptions struct {
@@ -118,97 +109,181 @@ type txOptions struct {
 	ReadOnly  bool
 }
 
-func (ch *clickhouse) beginTx(ctx context.Context, opts txOptions) (driver.Tx, error) {
-	ch.logf("[begin] tx=%t, data=%t", ch.inTransaction, ch.data != nil)
-	if ch.inTransaction {
+func (ch *clickhouse) beginTx(ctx context.Context, opts txOptions) (*clickhouse, error) {
+	ch.logf("[begin] tx=%t, data=%t", ch.inTransaction, ch.block != nil)
+	switch {
+	case ch.inTransaction:
 		return nil, sql.ErrTxDone
+	case ch.conn.closed:
+		return nil, driver.ErrBadConn
 	}
 	if finish := ch.watchCancel(ctx); finish != nil {
 		defer finish()
 	}
-	ch.data = nil
+	ch.block = nil
 	ch.inTransaction = true
 	return ch, nil
 }
 
 func (ch *clickhouse) Commit() error {
-	ch.logf("[commit] tx=%t, data=%t", ch.inTransaction, ch.data != nil)
-	if !ch.inTransaction {
-		return sql.ErrTxDone
-	}
+	ch.logf("[commit] tx=%t, data=%t", ch.inTransaction, ch.block != nil)
 	defer func() {
-		ch.data.reset()
-		ch.data = nil
+		if ch.block != nil {
+			ch.block.Reset()
+			ch.block = nil
+		}
 		ch.inTransaction = false
 	}()
-	if ch.data != nil {
-		if err := ch.data.write(ch.serverRevision, ch.conn); err != nil {
+	switch {
+	case !ch.inTransaction:
+		return sql.ErrTxDone
+	case ch.conn.closed:
+		return driver.ErrBadConn
+	}
+	if ch.block != nil {
+		if err := ch.writeBlock(ch.block); err != nil {
 			return err
 		}
-		if err := ch.ping(); err != nil {
+		// Send empty block as marker of end of data.
+		if err := ch.writeBlock(&data.Block{}); err != nil {
 			return err
 		}
-		if err := ch.gotPacket(ServerEndOfStreamPacket); err != nil {
+		if err := ch.encoder.Flush(); err != nil {
 			return err
 		}
+		return ch.process()
 	}
 	return nil
 }
 
 func (ch *clickhouse) Rollback() error {
-	ch.logf("[rollback] tx=%t, data=%t", ch.inTransaction, ch.data != nil)
+	ch.logf("[rollback] tx=%t, data=%t", ch.inTransaction, ch.block != nil)
 	if !ch.inTransaction {
 		return sql.ErrTxDone
 	}
-	ch.data = nil
+	if ch.block != nil {
+		ch.block.Reset()
+	}
+	ch.block = nil
+	ch.buffer = nil
 	ch.inTransaction = false
-	return ch.cancel()
-}
-
-func (ch *clickhouse) Close() error {
-	ch.data = nil
 	return ch.conn.Close()
 }
 
-func (ch *clickhouse) gotPacket(p uint64) error {
-	packet, err := readUvarint(ch.conn)
-	if err != nil {
-		return err
+func (ch *clickhouse) CheckNamedValue(nv *driver.NamedValue) error {
+	switch nv.Value.(type) {
+	case column.IP, column.UUID:
+		return nil
+	case nil, []byte, int8, int16, int32, int64, uint8, uint16, uint32, uint64, float32, float64, string, time.Time:
+		return nil
 	}
-	for packet != p {
-		switch packet {
-		case ServerExceptionPacket:
-			ch.logf("[got packet] <- exception")
-			return ch.exception()
-		case ServerProgressPacket:
-			progress, err := ch.progress()
-			if err != nil {
-				return err
-			}
-			ch.logf("[got packet] <- progress: rows=%d, bytes=%d, total rows=%d",
-				progress.bytes,
-				progress.rows,
-				progress.totalRows,
-			)
-		case ServerDataPacket:
-			var block block
-			if err := block.read(ch.serverRevision, ch.conn); err != nil {
-				return err
-			}
-			ch.logf("[got packet] <- data: columns=%d, rows=%d", block.numColumns, block.numRows)
-		default:
-			return fmt.Errorf("unexpected packet [%d] from server", packet)
-		}
-		if packet, err = readUvarint(ch.conn); err != nil {
+	switch v := nv.Value.(type) {
+	case
+		[]int, []int8, []int16, []int32, []int64,
+		[]uint, []uint8, []uint16, []uint32, []uint64,
+		[]float32, []float64,
+		[]string:
+		return nil
+	case net.IP:
+		nv.Value = column.IP(v)
+	case driver.Valuer:
+		value, err := v.Value()
+		if err != nil {
 			return err
+		}
+		nv.Value = value
+	default:
+		switch value := reflect.ValueOf(nv.Value); value.Kind() {
+		case reflect.Slice:
+			return nil
+		case reflect.Bool:
+			nv.Value = uint8(0)
+			if value.Bool() {
+				nv.Value = uint8(1)
+			}
+		case reflect.Int8:
+			nv.Value = int8(value.Int())
+		case reflect.Int16:
+			nv.Value = int16(value.Int())
+		case reflect.Int32:
+			nv.Value = int32(value.Int())
+		case reflect.Int64:
+			nv.Value = value.Int()
+		case reflect.Uint8:
+			nv.Value = uint8(value.Uint())
+		case reflect.Uint16:
+			nv.Value = uint16(value.Uint())
+		case reflect.Uint32:
+			nv.Value = uint32(value.Uint())
+		case reflect.Uint64:
+			nv.Value = uint64(value.Uint())
+		case reflect.Float32:
+			nv.Value = float32(value.Float())
+		case reflect.Float64:
+			nv.Value = float64(value.Float())
+		case reflect.String:
+			nv.Value = value.String()
 		}
 	}
 	return nil
 }
 
+func (ch *clickhouse) Close() error {
+	ch.block = nil
+	return ch.conn.Close()
+}
+
+func (ch *clickhouse) process() error {
+	packet, err := ch.decoder.Uvarint()
+	if err != nil {
+		return err
+	}
+	for {
+		switch packet {
+		case protocol.ServerPong:
+			ch.logf("[process] <- pong")
+			return nil
+		case protocol.ServerException:
+			ch.logf("[process] <- exception")
+			return ch.exception()
+		case protocol.ServerProgress:
+			progress, err := ch.progress()
+			if err != nil {
+				return err
+			}
+			ch.logf("[process] <- progress: rows=%d, bytes=%d, total rows=%d",
+				progress.rows,
+				progress.bytes,
+				progress.totalRows,
+			)
+		case protocol.ServerProfileInfo:
+			profileInfo, err := ch.profileInfo()
+			if err != nil {
+				return err
+			}
+			ch.logf("[process] <- profiling: rows=%d, bytes=%d, blocks=%d", profileInfo.rows, profileInfo.bytes, profileInfo.blocks)
+		case protocol.ServerData:
+			block, err := ch.readBlock()
+			if err != nil {
+				return err
+			}
+			ch.logf("[process] <- data: packet=%d, columns=%d, rows=%d", packet, block.NumColumns, block.NumRows)
+		case protocol.ServerEndOfStream:
+			ch.logf("[process] <- end of stream")
+			return nil
+		default:
+			ch.conn.Close()
+			return fmt.Errorf("[process] unexpected packet [%d] from server", packet)
+		}
+		if packet, err = ch.decoder.Uvarint(); err != nil {
+			return err
+		}
+	}
+}
+
 func (ch *clickhouse) cancel() error {
-	ch.logf("cancel request")
-	if err := writeUvarint(ch.conn, ClientCancelPacket); err != nil {
+	ch.logf("[cancel request]")
+	if err := ch.encoder.Uvarint(protocol.ClientCancel); err != nil {
 		return err
 	}
 	return ch.conn.Close()
@@ -220,11 +295,11 @@ func (ch *clickhouse) watchCancel(ctx context.Context) func() {
 		go func() {
 			select {
 			case <-done:
-				_ = ch.cancel()
+				ch.cancel()
 				finished <- struct{}{}
-				ch.logf("[ch] watchCancel <- done")
+				ch.logf("[cancel] <- done")
 			case <-finished:
-				ch.logf("[ch] watchCancel <- finished")
+				ch.logf("[cancel] <- finished")
 			}
 		}()
 		return func() {
@@ -234,5 +309,5 @@ func (ch *clickhouse) watchCancel(ctx context.Context) func() {
 			}
 		}
 	}
-	return nil
+	return func() {}
 }
